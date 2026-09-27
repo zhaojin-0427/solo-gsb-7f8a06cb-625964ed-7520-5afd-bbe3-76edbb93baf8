@@ -10,15 +10,23 @@ confident single-base substitutions as {"variants": [...]}.
 POST /align with a reference and 1..20 reads returns the best full-length
 semi-global placement of each read or its reverse complement, allowing
 substitutions and at most one single-base insertion/deletion.
+
+POST /digest with a sequence, a topology (linear/circular) and 1..5
+degenerate templates cuts at every template match (and its reverse
+complement) and returns the sorted cut positions plus the resulting
+linear or circular fragments.
 """
 
 from __future__ import annotations
+
+from typing import Literal
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .aligner import align_reads
 from .assembler import assemble
+from .digester import Template, digest
 from .variants import AlignedRead, call_variants
 
 MIN_READS = 2
@@ -38,6 +46,14 @@ MIN_ALIGN_READS = 1
 MAX_ALIGN_READS = 20
 MIN_MAX_EDITS = 0
 MAX_MAX_EDITS = 5
+
+MIN_DIGEST_SEQUENCE_LEN = 12
+MAX_DIGEST_SEQUENCE_LEN = 1000
+MIN_TEMPLATES = 1
+MAX_TEMPLATES = 5
+MIN_PATTERN_LEN = 2
+MAX_PATTERN_LEN = 12
+PATTERN_ALPHABET = frozenset("ACGTNRY")
 
 app = FastAPI(title="DNA Assembly API", version="1.0.0")
 
@@ -241,4 +257,80 @@ def variants_endpoint(request: VariantsRequest) -> VariantsResponse:
             )
             for variant in called
         ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /digest
+# ---------------------------------------------------------------------------
+
+
+class DigestTemplate(BaseModel):
+    pattern: str = Field(
+        min_length=MIN_PATTERN_LEN, max_length=MAX_PATTERN_LEN
+    )
+    offset: int = Field(ge=0, strict=True)
+
+    @field_validator("pattern")
+    @classmethod
+    def _validate_pattern(cls, pattern: str) -> str:
+        if not PATTERN_ALPHABET.issuperset(pattern):
+            raise ValueError("pattern may only contain A, C, G, T, N, R, Y")
+        return pattern
+
+    @model_validator(mode="after")
+    def _validate_offset(self) -> "DigestTemplate":
+        if self.offset > len(self.pattern):
+            raise ValueError(
+                "offset must be between 0 and the pattern length"
+            )
+        return self
+
+
+class DigestRequest(BaseModel):
+    sequence: str = Field(
+        min_length=MIN_DIGEST_SEQUENCE_LEN,
+        max_length=MAX_DIGEST_SEQUENCE_LEN,
+    )
+    topology: Literal["linear", "circular"]
+    templates: list[DigestTemplate] = Field(
+        min_length=MIN_TEMPLATES, max_length=MAX_TEMPLATES
+    )
+
+    @field_validator("sequence")
+    @classmethod
+    def _validate_sequence(cls, sequence: str) -> str:
+        if not ALPHABET.issuperset(sequence):
+            raise ValueError("sequence may only contain A, C, G, T")
+        return sequence
+
+
+class FragmentResponse(BaseModel):
+    start: int
+    end: int
+    sequence: str
+
+
+class DigestResponse(BaseModel):
+    cuts: list[int]
+    fragments: list[FragmentResponse]
+
+
+@app.post("/digest", response_model=DigestResponse)
+def digest_endpoint(request: DigestRequest) -> DigestResponse:
+    templates = [
+        Template(pattern=template.pattern, offset=template.offset)
+        for template in request.templates
+    ]
+    cuts, fragments = digest(request.sequence, request.topology, templates)
+    return DigestResponse(
+        cuts=cuts,
+        fragments=[
+            FragmentResponse(
+                start=fragment.start,
+                end=fragment.end,
+                sequence=fragment.sequence,
+            )
+            for fragment in fragments
+        ],
     )

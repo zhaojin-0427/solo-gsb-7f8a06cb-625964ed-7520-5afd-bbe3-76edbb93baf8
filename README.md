@@ -5,6 +5,7 @@
 - `POST /assemble`：给定 2～12 条读段，求包含全部读段的最短候选序列（最短公共超串）；长度相同时取字典序最小者，结果与输入顺序无关。
 - `POST /variants`：给定参考序列与已定位的正向读段，基于碱基质量做对数似然累加，检出高置信度的单碱基替换。
 - `POST /align`：给定参考序列与 1～20 条读段，对每条读段及其反向互补做半全局定位，允许替换及至多一次单碱基插入/缺失，返回编辑数不超过 `max_edits` 的最优比对。
+- `POST /digest`：给定 12～1000 位的序列、拓扑（`linear` / `circular`）与 1～5 个酶切模板（简并碱基模式 + 切点偏移），同时匹配模板及其反向互补，返回切点位置与线性/环状酶切片段。
 
 ## 启动
 
@@ -141,11 +142,74 @@ curl -s -X POST http://localhost:8000/align \
 }
 ```
 
+### `POST /digest`
+
+模拟酶切：在序列上定位每个模板的简并模式及其反向互补，按偏移计算切点，再按拓扑分段。
+
+请求体（JSON）：
+
+- `sequence`：12～1000 位，仅含 `A` / `C` / `G` / `T`（大写）；
+- `topology`：`linear` 或 `circular`；
+- `templates`：1～5 个模板，每个包含：
+  - `pattern`：2～12 位，仅含 `A` / `C` / `G` / `T` / `N` / `R` / `Y`（`N` 匹配任意碱基，`R` 匹配 `A`/`G`，`Y` 匹配 `C`/`T`）；
+  - `offset`：整数，0～`pattern` 长度。
+
+匹配与切点规则：
+
+- 模板正向命中起点为 `s` 时切点为 `s + offset`；其反向互补命中起点为 `s` 时切点为 `s + len(pattern) - offset`；
+- 环状序列允许匹配跨过末尾，切点对序列长度取模；线性序列不取模（切点可落在 0 或末端）；
+- `cuts` 为全部切点去重后的升序列表。
+
+分段规则（`fragments` 按 `start` 升序，每段含 `start` / `end` / `sequence`）：
+
+- 线性：按 `0`、切点、末端划分，相邻边界之间为一段；
+- 环状：相邻切点之间为一段，末段跨零点（`end < start`，`sequence` 为跨原点的拼接）；无切点时返回单段 `(0, 0, 原序列)`；只有一个切点时返回从该点起的整圈（`start == end == 切点`）；
+- 不产生空片段。
+
+线性示例：
+
+```bash
+curl -s -X POST http://localhost:8000/digest \
+  -H 'Content-Type: application/json' \
+  -d '{"sequence": "ACGTACGTACGT", "topology": "linear", "templates": [{"pattern": "CG", "offset": 1}]}'
+```
+
+```json
+{
+  "cuts": [2, 6, 10],
+  "fragments": [
+    {"start": 0, "end": 2, "sequence": "AC"},
+    {"start": 2, "end": 6, "sequence": "GTAC"},
+    {"start": 6, "end": 10, "sequence": "GTAC"},
+    {"start": 10, "end": 12, "sequence": "GT"}
+  ]
+}
+```
+
+环状示例（末段跨零点，`end < start`）：
+
+```bash
+curl -s -X POST http://localhost:8000/digest \
+  -H 'Content-Type: application/json' \
+  -d '{"sequence": "TTAACGTTAACG", "topology": "circular", "templates": [{"pattern": "CGT", "offset": 1}]}'
+```
+
+```json
+{
+  "cuts": [5, 11],
+  "fragments": [
+    {"start": 5, "end": 11, "sequence": "GTTAAC"},
+    {"start": 11, "end": 5, "sequence": "GTTAAC"}
+  ]
+}
+```
+
 ### 错误处理
 
 - `/assemble`：读段数量不在 2～12、长度不在 1～80，或含 `A/C/G/T` 以外字符时，返回 4xx（422）及错误详情。
 - `/variants`：参考序列或读段长度越界、含非法碱基、质量值越界、`sequence` 与 `qualities` 不等长、读段超出参考范围、`start` 为负等，均返回 4xx（422）及错误详情。
 - `/align`：参考序列长度不在 1～1000、读段数量不在 1～20、读段长度不在 1～80、含 `A/C/G/T` 以外字符（含小写）、`max_edits` 不是 0～5 的整数，或缺字段、类型错误等，均返回 4xx（422）及错误详情；读段无达标比对不报错，对应结果为 `null`。
+- `/digest`：序列长度不在 12～1000、含 `A/C/G/T` 以外字符（含小写）、`topology` 非 `linear`/`circular`、模板数量不在 1～5、`pattern` 长度不在 2～12 或含 `A/C/G/T/N/R/Y` 以外字符、`offset` 不是 0～`pattern` 长度的整数，或缺字段、类型错误等，均返回 4xx（422）及错误详情。
 
 ### 其他
 
@@ -173,3 +237,4 @@ python -m pytest tests/ -v
 - 字典序按 ASCII（`A < C < G < T`），因此结果对输入顺序、重复读段均不变。
 - `/variants` 的计算位于独立模块 `app/variants.py`，不依赖 Web 层；`ln(1-p)` 与 `ln(p/3)` 对质量值 2～40 预先查表，再按覆盖关系逐位累加四个候选的对数似然；遍历候选时严格使用「大于」更新最佳下标，天然实现 `A < C < G < T` 的并列裁决。
 - `/align` 的计算位于独立模块 `app/aligner.py`，不依赖 Web 层：对正向与反向互补两条序列，分别枚举每个起点上的无空位比对（替换）与一次单碱基插入/缺失比对，插入/缺失两侧的错配数用左右两个错配计数数组线性累加到 `O(读长)`；只保留 `编辑数 ≤ max_edits` 的候选，并按 `(edits, indels, start, end, strand, cigar)` 取最小。剪枝包括：错配计数达到 `max_edits` 后该方向停止扩展、候选在 `(edits, indels, start, end)` 前缀上已落败则不构造 CIGAR、找到起点最小的完美无空位比对后直接结束该链搜索。
+- `/digest` 的计算位于独立模块 `app/digester.py`，不依赖 Web 层：简并字母（`N`/`R`/`Y`）展开为碱基集合做逐位匹配，正向命中切点为 `起点 + offset`、反向互补命中切点为 `起点 + 模式长度 - offset`，环状对序列长度取模；切点去重排序后，线性按 `0`、切点、末端分段，环状按相邻切点分段（末段跨原点），边界去重保证不产生空片段。
